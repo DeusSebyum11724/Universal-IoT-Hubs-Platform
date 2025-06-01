@@ -1,0 +1,1 @@
+Link folosit pentru configurarea nRF52840: https://learn.sparkfun.com/tutorials/nrf52840-advanced-development-with-the-nrf5-sdk

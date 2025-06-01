@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "nrf_log.h": "c",
+        "app_button.h": "c",
+        "ble_lbs.h": "c",
+        "nrf_ble_gatt.h": "c",
+        "nrf_log_ctrl.h": "c",
+        "nrf_pwr_mgmt.h": "c",
+        "nrf_ble_qwr.h": "c"
+    }
+}

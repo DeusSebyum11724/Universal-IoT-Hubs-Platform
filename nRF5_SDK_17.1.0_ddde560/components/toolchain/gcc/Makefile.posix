@@ -1,0 +1,4 @@
+GNU_INSTALL_ROOT := /opt/arm-gcc/bin/
+GNU_PREFIX := arm-none-eabi
+GNU_VERSION := 10.3.1
+

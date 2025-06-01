@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -13,11 +14,51 @@
 #include "nvs.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "driver/uart.h"
 
 static const char *TAG = "webserver";
 
+// UART configuration defines for UART1 on GPIO16 (RX) and GPIO17 (TX)
+#define UART_PORT_NUM   UART_NUM_1
+#define UART_TX_PIN     17
+#define UART_RX_PIN     16
+#define UART_BUF_SIZE   1024
+
+/********************** UART FUNCTIONS ***************************/
+
+void init_uart(void) {
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_LOGI(TAG, "UART initialized on TX:%d RX:%d", UART_TX_PIN, UART_RX_PIN);
+}
+
+void uart_task(void *pvParameters) {
+    uint8_t data[UART_BUF_SIZE];
+    while (1) {
+        int len = uart_read_bytes(UART_PORT_NUM, data, UART_BUF_SIZE, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            data[len] = '\0';
+            ESP_LOGI(TAG, "Received over UART: %s", (char *)data);
+            // Echo the received data back over UART
+            uart_write_bytes(UART_PORT_NUM, (const char *)data, len);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/********************** SPIFFS AND HTTP SERVER FUNCTIONS ***************************/
+
 void init_spiffs(void) {
-    ESP_LOGI(TAG, "Montare SPIFFS...");
+    ESP_LOGI(TAG, "Mounting SPIFFS...");
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/spiffs",
         .partition_label = NULL,
@@ -26,16 +67,16 @@ void init_spiffs(void) {
     };
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Eroare la montare SPIFFS: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Error mounting SPIFFS: %s", esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "SPIFFS montat");
+        ESP_LOGI(TAG, "SPIFFS mounted");
     }
 }
 
 esp_err_t root_get_handler(httpd_req_t *req) {
     FILE *f = fopen("/spiffs/index.html", "r");
     if (!f) {
-        ESP_LOGE(TAG, "Nu pot deschide /spiffs/index.html");
+        ESP_LOGE(TAG, "Failed to open /spiffs/index.html");
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
@@ -64,11 +105,11 @@ esp_err_t connect_post_handler(httpd_req_t *req) {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi", NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Eroare nvs_open: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error opening NVS: %s", esp_err_to_name(err));
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Salvam: ssid='%s', pass='%s'", ssid, pass);
+    ESP_LOGI(TAG, "Saving: ssid='%s', pass='%s'", ssid, pass);
     nvs_set_str(nvs, "ssid", ssid);
     nvs_set_str(nvs, "pass", pass);
     nvs_commit(nvs);
@@ -76,7 +117,7 @@ esp_err_t connect_post_handler(httpd_req_t *req) {
 
     httpd_resp_sendstr(req, "OK");
 
-    ESP_LOGI(TAG, "\xE2\x99\xBB\xEF\xB8\x8F Config salvat, restart \xC3\xAEn 1s...");
+    ESP_LOGI(TAG, "Config saved, restarting in 1s...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
@@ -93,11 +134,11 @@ esp_err_t connect_post_handler(httpd_req_t *req) {
 char hue_bridge_ip[32] = {0};
 
 void discover_hue_bridge() {
-    ESP_LOGI(TAG, "Pornim cautarea Hue Bridge prin SSDP...");
+    ESP_LOGI(TAG, "Starting SSDP discovery for Hue Bridge...");
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "Eroare socket: %d", errno);
+        ESP_LOGE(TAG, "Socket error: %d", errno);
         return;
     }
 
@@ -129,18 +170,20 @@ void discover_hue_bridge() {
         if (len < 0) break;
 
         rx_buffer[len] = 0;
-        ESP_LOGI(TAG, "SSDP:%s", rx_buffer);
+        ESP_LOGI(TAG, "SSDP: %s", rx_buffer);
 
-        if (strstr(rx_buffer, "IpBridge") || strstr(rx_buffer, "hue-bridgeid") || strstr(rx_buffer, "Philips")) {
+        if (strstr(rx_buffer, "IpBridge") ||
+            strstr(rx_buffer, "hue-bridgeid") ||
+            strstr(rx_buffer, "Philips")) {
             strncpy(hue_bridge_ip, inet_ntoa(source_addr.sin_addr), sizeof(hue_bridge_ip) - 1);
-            ESP_LOGI(TAG, "Hue Bridge gasit: %s", hue_bridge_ip);
+            ESP_LOGI(TAG, "Hue Bridge found: %s", hue_bridge_ip);
             break;
         }
     }
     close(sock);
 
     if (strlen(hue_bridge_ip) == 0) {
-        ESP_LOGW(TAG, "Nicio punte Hue gasita");
+        ESP_LOGW(TAG, "No Hue Bridge found");
     }
 }
 
@@ -202,7 +245,7 @@ esp_err_t connect_hue_handler(httpd_req_t *req) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, response);
     } else {
-        ESP_LOGE(TAG, "Eroare la conectare Hue: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error connecting to Hue: %s", esp_err_to_name(err));
         httpd_resp_send_500(req);
     }
     esp_http_client_cleanup(client);
@@ -224,22 +267,27 @@ httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &find_hubs);
         httpd_register_uri_handler(server, &connect_hue);
         httpd_register_uri_handler(server, &whoami_uri);
-        ESP_LOGI(TAG, " Web server pornit pe http://192.168.4.1");
+        ESP_LOGI(TAG, "Web server started on http://192.168.4.1");
     } else {
-        ESP_LOGE(TAG, "Eroare la pornirea webserverului");
+        ESP_LOGE(TAG, "Error starting webserver");
     }
     return server;
 }
 
-void start_ap_mode() {
+/********************** WIFI FUNCTIONS ***************************/
+
+void start_ap_mode(void) {
     wifi_config_t wifi_config = { .ap = {
         .ssid = "ESP_Arty",
         .ssid_len = strlen("ESP_Arty"),
         .password = "12345678",
         .max_connection = 4,
-        .authmode = WIFI_AUTH_WPA_WPA2_PSK } };
+        .authmode = WIFI_AUTH_WPA_WPA2_PSK
+    } };
 
-    if (strlen("12345678") == 0) wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    if (strlen("12345678") == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
 
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -248,7 +296,7 @@ void start_ap_mode() {
     esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
     esp_wifi_start();
     start_webserver();
-    ESP_LOGI(TAG, " AP activat: ESP_Arty");
+    ESP_LOGI(TAG, "AP mode activated: ESP_Arty");
 }
 
 void start_sta_mode(const char *ssid, const char *pass) {
@@ -263,18 +311,18 @@ void start_sta_mode(const char *ssid, const char *pass) {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
-    ESP_LOGI(TAG, "\xF0\x9F\x93\xB6 STA conectare la SSID: '%s'", ssid);
+    ESP_LOGI(TAG, "STA connecting to SSID: '%s'", ssid);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, " WiFi deconectat, reconect\xC4\x83m...");
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, " Conectat, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
         nvs_handle_t nvs;
         if (nvs_open("wifi", NVS_READWRITE, &nvs) == ESP_OK) {
@@ -287,15 +335,28 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
 }
 
+/********************** MAIN APPLICATION ***************************/
+
 void app_main(void) {
+    // Initialize NVS flash
     nvs_flash_init();
+    // Initialize SPIFFS for serving files
     init_spiffs();
+    // Initialize TCP/IP network interface
     esp_netif_init();
+    // Create default event loop
     esp_event_loop_create_default();
 
+    // Register WiFi and IP event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
+    // Initialize UART on GPIO16 (RX) and GPIO17 (TX)
+    init_uart();
+    // Create a task to handle UART data
+    xTaskCreate(uart_task, "uart_task", 4096, NULL, 10, NULL);
+
+    // Retrieve WiFi configuration from NVS
     char ssid[64] = "", pass[64] = "";
     nvs_handle_t nvs;
     nvs_open("wifi", NVS_READONLY, &nvs);
@@ -305,12 +366,13 @@ void app_main(void) {
     esp_err_t err2 = nvs_get_str(nvs, "pass", pass, &len);
     nvs_close(nvs);
 
-    ESP_LOGI(TAG, " Citire NVS: ssid='%s' (%s), pass='%s' (%s)", ssid,
+    ESP_LOGI(TAG, "NVS read: ssid='%s' (%s), pass='%s' (%s)", ssid,
              esp_err_to_name(err1), pass, esp_err_to_name(err2));
 
+    // Decide AP or STA mode based on stored credentials
     if (strlen(ssid) > 0 && strlen(pass) > 0) {
         start_sta_mode(ssid, pass);
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(3000));
         start_webserver();
     } else {
         start_ap_mode();

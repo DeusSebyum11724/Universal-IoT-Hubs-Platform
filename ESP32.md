@@ -1,4 +1,6 @@
 # **ESP32 | WROOM32 DevKit C** 
+### ***FOLDER PATH: esp-idf/examples/protocols/http_server/simple***
+> we've reused an example because it was easier to setup the web_server
 
 ## Universal HQ for IOT Hubs
 
